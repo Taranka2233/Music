@@ -64,7 +64,11 @@ public class MusicScannerPlugin extends Plugin {
             ? MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
             : MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
 
-        String[] proj = {
+        // GENRE появился в MediaStore только на API 30. Без него радиостанции,
+        // которые фильтруют библиотеку по жанру, не поймают ничего.
+        boolean hasGenre = Build.VERSION.SDK_INT >= 30;
+
+        java.util.List<String> cols = new java.util.ArrayList<>(java.util.Arrays.asList(
             MediaStore.Audio.Media._ID,
             MediaStore.Audio.Media.TITLE,
             MediaStore.Audio.Media.ARTIST,
@@ -76,7 +80,9 @@ public class MusicScannerPlugin extends Plugin {
             MediaStore.Audio.Media.YEAR,
             MediaStore.Audio.Media.TRACK,
             MediaStore.Audio.Media.DISPLAY_NAME
-        };
+        ));
+        if (hasGenre) cols.add(MediaStore.Audio.Media.GENRE);
+        String[] proj = cols.toArray(new String[0]);
 
         // IS_MUSIC != 0 отсекает рингтоны, будильники и звук затвора камеры.
         String sel  = MediaStore.Audio.Media.IS_MUSIC + " != 0";
@@ -99,6 +105,8 @@ public class MusicScannerPlugin extends Plugin {
             int iYr  = c.getColumnIndexOrThrow(MediaStore.Audio.Media.YEAR);
             int iTrk = c.getColumnIndexOrThrow(MediaStore.Audio.Media.TRACK);
             int iNam = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME);
+            // getColumnIndex, а не OrThrow: на старых прошивках колонки просто нет
+            int iGen = hasGenre ? c.getColumnIndex(MediaStore.Audio.Media.GENRE) : -1;
 
             while (c.moveToNext()) {
                 long id  = c.getLong(iId);
@@ -117,6 +125,8 @@ public class MusicScannerPlugin extends Plugin {
                 o.put("year",   c.getInt(iYr));
                 o.put("no",     c.getInt(iTrk) % 1000);   // 1005 = диск 1, трек 5
                 o.put("name",   c.getString(iNam));
+                String g = iGen >= 0 ? c.getString(iGen) : null;
+                o.put("genre",  g == null ? "" : g);
                 out.put(o);
             }
         } catch (Exception e) {
