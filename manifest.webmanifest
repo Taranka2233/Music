@@ -1,0 +1,10 @@
+{
+  "name": "N54 Audio Deck",
+  "short_name": "N54",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#101216",
+  "theme_color": "#101216",
+  "orientation": "portrait",
+  "categories": ["music", "entertainment"]
+}
