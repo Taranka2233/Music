@@ -27,7 +27,10 @@ import com.getcapacitor.annotation.PermissionCallback;
         // Два алиаса намеренно. Просить оба разом нельзя: на API 33+
         // READ_EXTERNAL_STORAGE молча не выдаётся и запрос виснет.
         @Permission(alias = "audio13",  strings = { "android.permission.READ_MEDIA_AUDIO" }),
-        @Permission(alias = "audioOld", strings = { Manifest.permission.READ_EXTERNAL_STORAGE })
+        @Permission(alias = "audioOld", strings = { Manifest.permission.READ_EXTERNAL_STORAGE }),
+        // Без POST_NOTIFICATIONS на Android 13+ шторка и экран блокировки
+        // просто не покажутся: уведомление создастся и будет молча отброшено.
+        @Permission(alias = "notify",   strings = { "android.permission.POST_NOTIFICATIONS" })
     }
 )
 public class MusicScannerPlugin extends Plugin {
@@ -41,6 +44,31 @@ public class MusicScannerPlugin extends Plugin {
         JSObject r = new JSObject();
         r.put("granted", getPermissionState(alias()) == PermissionState.GRANTED);
         r.put("sdk", Build.VERSION.SDK_INT);
+        call.resolve(r);
+    }
+
+    /** Уведомления нужны только с API 33. Ниже — выдаются при установке. */
+    @PluginMethod
+    public void notifyAccess(PluginCall call) {
+        JSObject r = new JSObject();
+        if (Build.VERSION.SDK_INT < 33) { r.put("granted", true); call.resolve(r); return; }
+        r.put("granted", getPermissionState("notify") == PermissionState.GRANTED);
+        call.resolve(r);
+    }
+
+    @PluginMethod
+    public void requestNotify(PluginCall call) {
+        if (Build.VERSION.SDK_INT < 33 || getPermissionState("notify") == PermissionState.GRANTED) {
+            JSObject r = new JSObject(); r.put("granted", true); call.resolve(r);
+        } else {
+            requestPermissionForAlias("notify", call, "afterNotify");
+        }
+    }
+
+    @PermissionCallback
+    private void afterNotify(PluginCall call) {
+        JSObject r = new JSObject();
+        r.put("granted", getPermissionState("notify") == PermissionState.GRANTED);
         call.resolve(r);
     }
 
@@ -82,16 +110,31 @@ public class MusicScannerPlugin extends Plugin {
             MediaStore.Audio.Media.DISPLAY_NAME
         ));
         if (hasGenre) cols.add(MediaStore.Audio.Media.GENRE);
+        // Флаг «это музыка», а не рингтон/будильник/уведомление
+        cols.add(MediaStore.Audio.Media.IS_MUSIC);
+        // Папка: с API 29 есть RELATIVE_PATH, ниже — вытащим из DATA
+        boolean hasRel = Build.VERSION.SDK_INT >= 29;
+        cols.add(hasRel ? MediaStore.Audio.Media.RELATIVE_PATH : MediaStore.Audio.Media.DATA);
         String[] proj = cols.toArray(new String[0]);
 
-        // IS_MUSIC != 0 отсекает рингтоны, будильники и звук затвора камеры.
-        String sel  = MediaStore.Audio.Media.IS_MUSIC + " != 0";
+        // Запрашиваем ВСЁ и отсеиваем сами — так знаем точное число пропущенных
+        // и можем отдать их по требованию. Никакого обхода диска: это выборка
+        // из готового индекса, который системный MediaScanner уже построил
+        // по всему устройству, включая карту памяти.
+        final boolean includeAll = Boolean.TRUE.equals(call.getBoolean("includeAll", false));
         String sort = MediaStore.Audio.Media.TITLE + " COLLATE NOCASE ASC";
+        int skipped = 0;
+        java.util.Set<String> folders = new java.util.TreeSet<>();
 
         JSArray out = new JSArray();
         Uri artBase = Uri.parse("content://media/external/audio/albumart");
+        // Ссылку на обложку MediaStore отдаёт для любого альбома, даже если
+        // картинки нет — она просто не откроется. Раньше мы отдавали её всегда,
+        // и дека считала, что обложка есть: поиск в сети такие треки пропускал.
+        // Проверяем по-настоящему. Кешируем по альбому: ~40 проверок на 300 треков.
+        java.util.HashMap<Long, Boolean> artOk = new java.util.HashMap<>();
 
-        try (Cursor c = getContext().getContentResolver().query(col, proj, sel, null, sort)) {
+        try (Cursor c = getContext().getContentResolver().query(col, proj, null, null, sort)) {
             if (c == null) { call.reject("MediaStore вернул null", "QUERY_NULL"); return; }
 
             int iId  = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID);
@@ -107,15 +150,35 @@ public class MusicScannerPlugin extends Plugin {
             int iNam = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME);
             // getColumnIndex, а не OrThrow: на старых прошивках колонки просто нет
             int iGen = hasGenre ? c.getColumnIndex(MediaStore.Audio.Media.GENRE) : -1;
+            int iMus = c.getColumnIndex(MediaStore.Audio.Media.IS_MUSIC);
+            int iDir = c.getColumnIndex(hasRel ? MediaStore.Audio.Media.RELATIVE_PATH
+                                               : MediaStore.Audio.Media.DATA);
 
             while (c.moveToNext()) {
+                if (!includeAll && iMus >= 0 && c.getInt(iMus) == 0) { skipped++; continue; }
+
                 long id  = c.getLong(iId);
                 long aid = c.getLong(iAId);
+
+                String dir = iDir >= 0 ? c.getString(iDir) : null;
+                if (dir != null && !hasRel) {                 // из DATA берём каталог
+                    int cut = dir.lastIndexOf('/');
+                    dir = cut > 0 ? dir.substring(0, cut) : dir;
+                }
+                if (dir != null && !dir.isEmpty()) folders.add(dir);
 
                 JSObject o = new JSObject();
                 o.put("id",     String.valueOf(id));
                 o.put("uri",    ContentUris.withAppendedId(col, id).toString());
-                o.put("artUri", ContentUris.withAppendedId(artBase, aid).toString());
+                Boolean has = artOk.get(aid);
+                if (has == null) {
+                    try (java.io.InputStream in = getContext().getContentResolver()
+                            .openInputStream(ContentUris.withAppendedId(artBase, aid))) {
+                        has = in != null;
+                    } catch (Exception e) { has = false; }
+                    artOk.put(aid, has);
+                }
+                o.put("artUri", has ? ContentUris.withAppendedId(artBase, aid).toString() : "");
                 o.put("title",  c.getString(iTit));
                 o.put("artist", c.getString(iArt));
                 o.put("album",  c.getString(iAlb));
@@ -125,6 +188,7 @@ public class MusicScannerPlugin extends Plugin {
                 o.put("year",   c.getInt(iYr));
                 o.put("no",     c.getInt(iTrk) % 1000);   // 1005 = диск 1, трек 5
                 o.put("name",   c.getString(iNam));
+                o.put("folder", dir == null ? "" : dir);
                 String g = iGen >= 0 ? c.getString(iGen) : null;
                 o.put("genre",  g == null ? "" : g);
                 out.put(o);
@@ -134,9 +198,15 @@ public class MusicScannerPlugin extends Plugin {
             return;
         }
 
+        JSArray fl = new JSArray();
+        for (String f : folders) fl.put(f);
+
         JSObject ret = new JSObject();
         ret.put("tracks", out);
         ret.put("count", out.length());
+        ret.put("skipped", skipped);          // рингтоны, будильники, звук затвора
+        ret.put("folders", fl);
+        ret.put("folderCount", folders.size());
         call.resolve(ret);
     }
 }
